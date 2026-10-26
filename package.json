@@ -1,0 +1,14 @@
+{
+  "name": "tracker-ai-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Groq proxy for the Tracker app (coach, food suggestions, photo macros).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

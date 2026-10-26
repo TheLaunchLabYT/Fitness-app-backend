@@ -1,0 +1,18 @@
+# Optional Render Blueprint. You can also create the Web Service by hand (see README).
+services:
+  - type: web
+    name: tracker-ai
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: APP_TOKEN
+        sync: false
+      - key: TEXT_MODEL
+        value: llama-3.3-70b-versatile
+      - key: VISION_MODEL
+        value: qwen/qwen3.8-27b
