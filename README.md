@@ -9,6 +9,8 @@ Small Node server that the Tracker app calls for AI. It holds your Groq key so t
 | `POST /food/suggest` | What to eat next, from targets, today's log and your meals | `TEXT_MODEL` |
 | `POST /food/estimate` | Macros for a meal described in words | `TEXT_MODEL` |
 | `POST /food/scan` | Macros from a food photo | `VISION_MODEL` |
+| `POST /split/build` | Weekly split + nutrition from the split builder | `TEXT_MODEL` |
+| `POST /assistant` | Chat reply for Train › ask ai, using your own data | `TEXT_MODEL` |
 
 All POST routes need the header `x-app-token` to match `APP_TOKEN`.
 

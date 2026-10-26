@@ -7,6 +7,8 @@
 //   POST /food/suggest    -> what to eat next, from your targets and saved meals
 //   POST /food/estimate   -> macros for a meal you describe in words
 //   POST /food/scan       -> macros from a photo of your food
+//   POST /split/build     -> a weekly training split + nutrition advice from the split builder
+//   POST /assistant       -> a chat reply for Train › ask ai, using the user's own data
 //
 // No dependencies: needs Node 18+ (Render uses Node 22 by default).
 
@@ -146,13 +148,29 @@ Pick exactly one "kind":
 - "rest": full day off.
 - "recovery": light movement only (walk, mobility, stretching, easy cycling), 15-40 min.
 - "run": one run. Give a run type (Easy, Tempo, Long, Intervals), distance in km and a target pace or effort.
-- "workout": one strength session with 4-7 exercises.
+- "workout": one strength session with 3-8 exercises.
 
-Rules:
+1. Start from the split.
+- "plannedToday" is today's workout. When plannedToday.fromSplit is true it comes from the user's split ("split" has the split, today's day and the next few days). That is the starting point: they expect to do it.
+- Then tailor it. You may keep it exactly; adjust it (add an exercise, remove one, swap one for another, change sets or reps); or replace it entirely with a different session, a run, recovery or rest. Keep as much of the split day as makes sense: a good reason is needed for each change (soreness, an injury or note, time, a weak point in their goal, what they did recently, how busy their day is).
+- Add exercises only when the day has room and they fit the day's focus and the user's goal (goals.training).
+- If you replace or skip the split day, say where it could go instead (e.g. tomorrow, or swap with the next rest day) so the week stays balanced.
+- With no plannedToday: plan from the split's today, their history and weekly goal as usual.
+- List every change in "changes", in order. Keep exercise names exactly as in plannedToday for the ones you keep.
+
+2. Weigh their schedule ("schedule", from their Quill planner; null means unknown, then ignore this part).
+- today / tomorrow / dayAfter: level (light, normal, busy, packed), busyMin (fixed events + planned work), freeMin (free time left in their usual windows), due (tasks due that day with priority), tests (exams that day). behind: whether they are behind on their tasks overall. trainingTimeToday: when Quill scheduled today's session.
+- Decide how important training is today compared with what else needs the time. Training matters: consistency over the week, their goal, and it helps with stress and focus, so don't drop it for ordinary busyness or low-priority tasks.
+- But when today is packed or busy AND something important is close (a test today or tomorrow, an urgent or high-priority task due today or tomorrow, or behind.status "behind"), protect that time: shorten the session (about 30-45 min, keep the main lifts, drop accessories), move it to a better time, or skip it for a short walk and say what the time is better used for.
+- Light day and feeling good: train as planned; adding one accessory is fine.
+- Also consider how many sessions they did this week (thisWeek) versus goals.sessionsPerWeek: if they are behind on training, it matters more today.
+- Put the decision in "schedule": call "train" (as planned), "shorter", "move" (with "at": a suggested start time "HH:MM" if useful) or "skip". "note": one short sentence naming the reason from their day (e.g. "Physics test tomorrow and 1h free: 35 min, main lifts only."). Never list their other tasks beyond what is needed to explain.
+
+3. General rules.
 - Read the check-in first. Poor sleep, low energy or high soreness means go easier. Pain or illness means rest or recovery, and suggest seeing a professional if pain is sharp or lasts.
-- Use the history: avoid training the same sore muscles two days in a row, balance lifting and running toward their weekly goal, and keep hard days apart.
-- If a workout is already planned for today, keep it if the check-in allows (repeat its name and exercises), or swap it for something easier and say why.
-- For workouts, prefer exercise names the user has done before. weightKg is the working weight; use 0 when unsure so the app fills in last time's weight.
+- Avoid training the same sore muscles two days in a row and keep hard days apart.
+- checkIn.timeAvailableMin is a hard limit when given: about 10 min warm-up plus 2-3 min per set.
+- Prefer exercise names the user has done before. weightKg is the working weight; use 0 when unsure (the app fills in last time's weight). Keep the planned weight for exercises you keep.
 - Keep the run distance realistic for this user: base it on their recent runs (new runners: 2-5 km).
 - Plain, friendly, short. No emojis. Lowercase title, max 5 words.
 
@@ -161,14 +179,17 @@ Reply with JSON only:
   "kind": "rest" | "recovery" | "run" | "workout",
   "title": string,
   "summary": string (1-2 sentences, what to do today),
-  "why": string (1 sentence, refer to their check-in or history),
+  "why": string (1 sentence, refer to their check-in, split, history or day),
   "intensity": "low" | "moderate" | "high",
   "durationMin": number,
   "run": null | { "type": "Easy"|"Tempo"|"Long"|"Intervals", "distanceKm": number, "target": string },
-  "workout": null | { "name": string, "exercises": [ { "name": string, "sets": number, "reps": number, "weightKg": number } ] },
+  "workout": null | { "name": string, "exercises": [ { "name": string, "sets": number, "reps": number, "weightKg": number } ] } (the final list, after your changes),
+  "basedOn": string | null (name of the split day you started from),
+  "changes": [ { "kind": "add" | "remove" | "swap" | "change", "name": string (the exercise; for swap the one taken out), "to": string (swap only: the replacement), "detail": string (e.g. "3 x 12" or "4 -> 3 sets"), "why": string (short) } ],
+  "schedule": null | { "call": "train" | "shorter" | "move" | "skip", "note": string, "at": string | null },
   "steps": [string] (2-6 short steps: warm-up, main part, cool-down, or recovery routine)
 }`;
-  const out = await groq({ model: TEXT_MODEL, system, user: JSON.stringify(body).slice(0, 24000), temperature: 0.5 });
+  const out = await groq({ model: TEXT_MODEL, system, user: JSON.stringify(body).slice(0, 24000), temperature: 0.5, maxTokens: 1800 });
 
   const kind = oneOf(out.kind, ['rest', 'recovery', 'run', 'workout'], 'recovery');
   const run =
@@ -179,9 +200,13 @@ Reply with JSON only:
     .map((e) => ({ name: str(e?.name, 60), sets: num(e?.sets, 1, 10), reps: num(e?.reps, 1, 50), weightKg: num(e?.weightKg, 0, 500, 1) }))
     .filter((e) => e.name);
   const workout = kind === 'workout' && exercises.length ? { name: str(out.workout?.name, 60) || 'Workout', exercises } : null;
+  const finalKind = kind === 'workout' && !workout ? 'recovery' : kind === 'run' && !run ? 'recovery' : kind;
+  const planned = body?.plannedToday && Array.isArray(body.plannedToday.exercises) ? body.plannedToday : null;
+  const { changes, replaced } = coachChanges(planned, finalKind === 'workout' ? workout : null, arr(out.changes, 12));
+  const sc = out.schedule && typeof out.schedule === 'object' && body?.schedule ? out.schedule : null;
   return {
-    kind: kind === 'workout' && !workout ? 'recovery' : kind === 'run' && !run ? 'recovery' : kind,
-    title: str(out.title, 60) || kind,
+    kind: finalKind,
+    title: str(out.title, 60) || finalKind,
     summary: str(out.summary, 400),
     why: str(out.why, 300),
     intensity: oneOf(out.intensity, ['low', 'moderate', 'high'], 'low'),
@@ -189,7 +214,49 @@ Reply with JSON only:
     run,
     workout,
     steps: arr(out.steps, 8).map((s) => str(s, 200)).filter(Boolean),
+    basedOn: planned ? str(out.basedOn, 60) || str(planned.name, 60) || null : null,
+    changes,
+    replaced,
+    schedule: sc
+      ? {
+          call: oneOf(sc.call, ['train', 'shorter', 'move', 'skip'], 'train'),
+          note: str(sc.note, 240),
+          ...(/^\d{1,2}:\d{2}$/.test(String(sc.at || '')) ? { at: String(sc.at) } : {}),
+        }
+      : null,
   };
+}
+
+/** The real difference between today's plan and the coach's workout. The model's own list only supplies the reasons
+ *  (and which removed/added pair is a swap), so what the app shows always matches the exercises you'll do. */
+function coachChanges(planned, workout, said) {
+  if (!planned || !planned.exercises.length) return { changes: [], replaced: false };
+  const key = (n) => String(n || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const before = new Map(planned.exercises.map((e) => [key(e.name), e]));
+  const after = workout ? new Map(workout.exercises.map((e) => [key(e.name), e])) : new Map();
+  const kept = [...before.keys()].filter((k) => after.has(k));
+  // Not a workout any more, or nothing in common: the split day was replaced entirely.
+  if (!workout || kept.length === 0) return { changes: [], replaced: true };
+  const notes = said.filter((c) => c && typeof c === 'object').map((c) => ({ kind: String(c.kind || ''), name: key(c.name), to: key(c.to), why: str(c.why, 160) }));
+  const whyFor = (k, kind) => (notes.find((c) => (c.name === k || c.to === k) && (!kind || c.kind === kind)) || notes.find((c) => c.name === k || c.to === k))?.why || '';
+  const sr = (e) => `${e.sets} × ${e.reps}`;
+  const removed = [...before.keys()].filter((k) => !after.has(k));
+  const added = [...after.keys()].filter((k) => !before.has(k));
+  const changes = [];
+  for (const c of notes) {
+    if (c.kind !== 'swap' || !removed.includes(c.name) || !added.includes(c.to)) continue;
+    removed.splice(removed.indexOf(c.name), 1);
+    added.splice(added.indexOf(c.to), 1);
+    const e = after.get(c.to);
+    changes.push({ kind: 'swap', name: before.get(c.name).name, to: e.name, detail: sr(e), why: c.why });
+  }
+  for (const k of removed) changes.push({ kind: 'remove', name: before.get(k).name, why: whyFor(k, 'remove') });
+  for (const k of added) { const e = after.get(k); changes.push({ kind: 'add', name: e.name, detail: sr(e), why: whyFor(k, 'add') }); }
+  for (const k of kept) {
+    const a = before.get(k), b = after.get(k);
+    if (num(a.sets, 0, 99) !== b.sets || num(a.reps, 0, 999) !== b.reps) changes.push({ kind: 'change', name: b.name, detail: `${sr({ sets: num(a.sets, 0, 99), reps: num(a.reps, 0, 999) })} → ${sr(b)}`, why: whyFor(k, 'change') });
+  }
+  return { changes: changes.slice(0, 12), replaced: false };
 }
 
 async function foodSuggest(body) {
@@ -261,11 +328,105 @@ async function foodScan(body) {
   return foodResult(await groq({ model: VISION_MODEL, system, user, temperature: 0.2, maxTokens: 1400 }));
 }
 
+const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+async function splitBuild(body) {
+  const system = `You are a strength and conditioning coach inside a lifting and running tracker. The user filled in a split builder: their goal, where they are now (experience, body, current working weights, injuries) and what they do now (days available, session length, equipment, runs, daily activity, current routine). You also get their recent logged training.
+
+Design ONE weekly training split (Monday to Sunday) that fits all of it, plus nutrition direction.
+
+Training rules:
+- Lifting days: exactly answers.daysPerWeek (max 6). If answers.weekdays is not empty, lift ONLY on those weekdays. Otherwise spread hard days out.
+- Pick the structure that suits the days and experience: 2-3 days full body; 3 days PPL only for experienced lifters chasing muscle; 4 days upper/lower; 5 days upper/lower + push/pull/legs; 6 days push/pull/legs twice. Change it when their goal or current routine clearly calls for something else, and say why.
+- Each muscle group about twice a week where possible. Big compound lifts first, then accessories.
+- Fit the session length: about 1 exercise per 10-12 minutes (30 min = 3, 60 min = 5-6, 90 min = 7).
+- Reps by goal: strength 3-6 on main lifts; muscle 6-12; fat loss 8-15 and keep lifting heavy-ish to hold muscle; fitness 8-12; endurance 12-15 and fewer lifting days.
+- Sets: beginners 2-3, others 3-4.
+- Equipment: "gym" any; "dumbbells" only dumbbells, a bench and a pull-up bar; "bodyweight" no equipment except a pull-up bar.
+- Respect injuries and limits in answers.limits: leave out or swap exercises that load that area.
+- Prefer exercise names the user already uses (history.knownExercises). Otherwise use standard names like "Bench Press", "Romanian Deadlift", "Lat Pulldown".
+- weightKg: a sensible starting working weight for the given reps, based on answers.lifts or history.bestLifts. Use 0 when you have nothing to go on; the app then fills in last time's weight.
+- Runs: answers.runsPerWeek runs. Put them on non-lifting days first, never a hard run the day before heavy legs, at most one long run. Base distances on their recent runs (new runners 2-5 km). A day may have both a lift and an easy run.
+- Rest days: rest true, no exercises, run null (or a run if it is a run-only day; then rest is false).
+- Day names short, e.g. "Push", "Upper A", "Lower", "Full body", "Easy run", "Rest".
+
+Nutrition:
+- goal: "cut", "maintain" or "bulk". Follow answers.foodGoal unless it clearly conflicts with their goal; then pick the better one and explain in the tips.
+- pace: "gentle", "standard" or "fast". Beginners bulking: standard. Experienced lifters bulking: gentle. Cutting with lots to lose: standard or fast.
+- proteinPerKg: 1.6-2.4 (higher when cutting), or null for the default.
+- tips: 2-4 short, practical tips tied to their training (pre/post training food, run days, protein spread).
+
+Style: plain, friendly, short. No emojis. Sentence case.
+
+Reply with JSON only:
+{
+  "name": string (short name for the split, e.g. "4-day upper lower"),
+  "summary": string (2 sentences: why this split fits their goal and schedule),
+  "week": [ 7 items, Monday first: { "day": "Mon".."Sun", "rest": boolean, "name": string, "focus": string (muscles or aim), "exercises": [ { "name": string, "sets": number, "reps": number, "weightKg": number } ], "run": null | { "type": "Easy"|"Tempo"|"Long"|"Intervals", "distanceKm": number } } ],
+  "progression": [string] (2-4 short rules for adding weight or reps over the weeks),
+  "nutrition": { "goal": "cut"|"maintain"|"bulk", "pace": "gentle"|"standard"|"fast", "proteinPerKg": number | null, "tips": [string] }
+}`;
+  const out = await groq({ model: TEXT_MODEL, system, user: JSON.stringify(body).slice(0, 24000), temperature: 0.4, maxTokens: 3000 });
+
+  const raw = arr(out.week, 7);
+  const week = DAYS.map((d, i) => {
+    const w = raw.find((x) => x?.day === d) ?? raw[i] ?? {};
+    const exercises = arr(w.exercises, 9)
+      .map((e) => ({ name: str(e?.name, 60), sets: num(e?.sets, 1, 10), reps: num(e?.reps, 1, 50), weightKg: num(e?.weightKg, 0, 500, 1) }))
+      .filter((e) => e.name && e.sets > 0 && e.reps > 0);
+    const run = w.run && typeof w.run === 'object' && num(w.run.distanceKm, 0, 60, 1) > 0
+      ? { type: oneOf(w.run.type, RUN_TYPES, 'Easy'), distanceKm: num(w.run.distanceKm, 0.5, 60, 1) }
+      : null;
+    const rest = !exercises.length && !run;
+    return { day: d, rest, name: rest ? 'Rest' : str(w.name, 40) || 'Workout', focus: str(w.focus, 80), exercises, run };
+  });
+  if (!week.some((d) => d.exercises.length)) throw new HttpError(502, 'The AI did not return a usable split, try again');
+  const n = out.nutrition || {};
+  const ppk = Number(n.proteinPerKg);
+  return {
+    name: str(out.name, 60) || 'My split',
+    summary: str(out.summary, 500),
+    week,
+    progression: arr(out.progression, 5).map((x) => str(x, 200)).filter(Boolean),
+    nutrition: {
+      goal: oneOf(n.goal, ['cut', 'maintain', 'bulk'], oneOf(body?.answers?.foodGoal, ['cut', 'maintain', 'bulk'], 'maintain')),
+      pace: oneOf(n.pace, ['gentle', 'standard', 'fast'], 'standard'),
+      proteinPerKg: Number.isFinite(ppk) && ppk >= 1.2 && ppk <= 3 ? Math.round(ppk * 10) / 10 : null,
+      tips: arr(n.tips, 5).map((x) => str(x, 200)).filter(Boolean),
+    },
+  };
+}
+
+async function assistant(body) {
+  const msgs = arr(body?.messages, 12)
+    .map((m) => ({ role: m?.role === 'assistant' ? 'assistant' : 'user', content: str(m?.content, 2000) }))
+    .filter((m) => m.content);
+  if (!msgs.length || msgs[msgs.length - 1].role !== 'user') throw new HttpError(400, 'Ask something first');
+  const system = `You are the assistant inside "stack", a personal lifting, running and nutrition tracker. You talk with the user about their training, food and progress.
+
+You get their data in "context" (all weights in kg, distances in km; show them in the units they use if they mention them): recent workouts and runs, their split, today's plan and check-ins, food targets and what they ate today, body data and weight trend, sets per week for each muscle over the last 4 weeks, goals, their Quill schedule if connected, and their own reflections.
+
+How to answer:
+- Use their actual numbers. Point to specific workouts, lifts, muscles or days when relevant. Don't invent data that isn't there; say what's missing and how to log it.
+- Be practical: give a clear recommendation first, then a short reason. Concrete sets, reps, weights, foods or amounts where useful.
+- Evidence-based and safe: no extreme diets, no crash cuts, no PED advice. For pain, injury, illness or medical questions, give general guidance and suggest seeing a professional; never diagnose.
+- If they ask the app to change something (their split, a plan, targets), explain how to do it in the app: Home (today's workout and check-in), Train (pages picked from the menu at the top: split, workouts, runs, food with targets and saved meals, ask ai (this chat), trends and personal records), Progress (body map, your details, reflections), the + button (log a workout, run or food), Settings.
+- Friendly, plain and short: usually 2-6 sentences, or a short list with "- " bullets. No markdown headings, no tables, no emojis.
+
+Reply with JSON only: { "reply": string }`;
+  const transcript = msgs.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n\n');
+  const user = `context: ${JSON.stringify(body?.context ?? {}).slice(0, 16000)}\n\nConversation so far:\n${transcript}\n\nWrite the assistant's next reply.`;
+  const out = await groq({ model: TEXT_MODEL, system, user, temperature: 0.6, maxTokens: 1200 });
+  return { reply: str(out.reply, 4000) };
+}
+
 const ROUTES = {
   '/coach': coach,
   '/food/suggest': foodSuggest,
   '/food/estimate': foodEstimate,
   '/food/scan': foodScan,
+  '/split/build': splitBuild,
+  '/assistant': assistant,
 };
 
 /* ---------------- server ---------------- */
@@ -316,7 +477,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     if (req.method === 'GET' && (path === '/' || path === '/health')) {
-      const info = { ok: true, service: 'tracker-ai', version: 2, models: { text: TEXT_MODEL, vision: VISION_MODEL }, keySet: !!GROQ_API_KEY };
+      const info = { ok: true, service: 'tracker-ai', version: 5, models: { text: TEXT_MODEL, vision: VISION_MODEL }, keySet: !!GROQ_API_KEY };
       // /health?check=1 makes one tiny real call so the app can show whether the AI actually answers.
       if (/[?&]check=1/.test(req.url || '')) {
         try {
