@@ -18,7 +18,7 @@ All POST routes need the header `x-app-token` to match `APP_TOKEN`.
 |---|---|
 | `GROQ_API_KEY` | your key from console.groq.com (starts with `gsk_`) |
 | `APP_TOKEN` | any long random string; the same string goes in the app's `src/config.ts` |
-| `TEXT_MODEL` | optional, default `llama-3.3-70b-versatile` |
+| `TEXT_MODEL` | optional, default `openai/gpt-oss-120b` |
 | `VISION_MODEL` | optional, default `qwen/qwen3.8-27b` (Groq's image model; it is a preview model, swap it here if Groq retires it) |
 
 ## Run locally

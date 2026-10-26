@@ -13,6 +13,6 @@ services:
       - key: APP_TOKEN
         sync: false
       - key: TEXT_MODEL
-        value: llama-3.3-70b-versatile
+        value: openai/gpt-oss-120b
       - key: VISION_MODEL
         value: qwen/qwen3.8-27b

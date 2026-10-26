@@ -15,8 +15,10 @@ import http from 'node:http';
 const PORT = Number(process.env.PORT) || 3000;
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const APP_TOKEN = process.env.APP_TOKEN || '';
-const TEXT_MODEL = process.env.TEXT_MODEL || 'llama-3.3-70b-versatile';
-const VISION_MODEL = process.env.VISION_MODEL || 'qwen/qwen3.8-27b';
+const DEFAULT_TEXT_MODEL = 'openai/gpt-oss-120b'; // Groq retired llama-3.3-70b-versatile in Aug 2026
+const DEFAULT_VISION_MODEL = 'qwen/qwen3.8-27b';
+const TEXT_MODEL = (process.env.TEXT_MODEL || DEFAULT_TEXT_MODEL).trim();
+const VISION_MODEL = (process.env.VISION_MODEL || DEFAULT_VISION_MODEL).trim();
 const MAX_BODY = 8 * 1024 * 1024; // photos are resized in the app, this is just a ceiling
 const GROQ_URL = process.env.GROQ_URL || 'https://api.groq.com/openai/v1/chat/completions';
 
@@ -77,11 +79,14 @@ class HttpError extends Error {
 }
 
 async function groq({ model, system, user, temperature = 0.4, maxTokens = 1400 }) {
+  // gpt-oss models think before answering; that thinking counts toward the token limit.
+  const reasoning = /gpt-oss/i.test(model);
   if (!GROQ_API_KEY) throw new HttpError(500, 'GROQ_API_KEY is missing on the server');
   const body = {
     model,
     temperature,
-    max_completion_tokens: maxTokens,
+    max_completion_tokens: reasoning ? maxTokens + 2500 : maxTokens,
+    ...(reasoning ? { reasoning_effort: 'low' } : {}),
     response_format: { type: 'json_object' },
     messages: [
       { role: 'system', content: system },
@@ -110,6 +115,17 @@ async function groq({ model, system, user, temperature = 0.4, maxTokens = 1400 }
   if (res.status === 400 && /json/i.test(JSON.stringify(json))) {
     const { response_format, ...rest } = body;
     ({ res, json } = await call(rest));
+  }
+  // A mistyped or retired model name in Render's env vars: fall back to the built-in default.
+  const fallback = model === VISION_MODEL ? DEFAULT_VISION_MODEL : DEFAULT_TEXT_MODEL;
+  if ((res.status === 404 || /does not exist|model_not_found|decommissioned/i.test(JSON.stringify(json))) && model !== fallback) {
+    console.warn(`Model "${model}" was rejected by Groq, using "${fallback}". Fix TEXT_MODEL / VISION_MODEL on Render.`);
+    body.model = fallback;
+    if (/gpt-oss/i.test(fallback)) {
+      body.reasoning_effort = 'low';
+      body.max_completion_tokens = maxTokens + 2500;
+    }
+    ({ res, json } = await call(body));
   }
   if (res.status === 429) throw new HttpError(429, 'Groq rate limit reached, try again in a minute');
   if (!res.ok) {
@@ -300,7 +316,18 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     if (req.method === 'GET' && (path === '/' || path === '/health')) {
-      return send(res, 200, { ok: true, service: 'tracker-ai', models: { text: TEXT_MODEL, vision: VISION_MODEL }, keySet: !!GROQ_API_KEY });
+      const info = { ok: true, service: 'tracker-ai', version: 2, models: { text: TEXT_MODEL, vision: VISION_MODEL }, keySet: !!GROQ_API_KEY };
+      // /health?check=1 makes one tiny real call so the app can show whether the AI actually answers.
+      if (/[?&]check=1/.test(req.url || '')) {
+        try {
+          await groq({ model: TEXT_MODEL, system: 'Reply with JSON only: {"ok": true}', user: 'ping', temperature: 0, maxTokens: 50 });
+          info.aiOk = true; // the model answered with JSON
+        } catch (e) {
+          info.aiOk = false;
+          info.aiError = e.message;
+        }
+      }
+      return send(res, 200, info);
     }
     const handler = ROUTES[path];
     if (!handler || req.method !== 'POST') return send(res, 404, { error: 'Not found' });
